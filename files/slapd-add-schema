@@ -1,0 +1,180 @@
+#!/bin/sh
+
+tmpconf=$(mktemp)
+tmpdir=$(mktemp -d)
+
+# clean up our temp files
+_exit() {
+  rm -f $tmpconf
+  rm -rf $tmpdir
+}
+
+# ensure we cleanup when we quit
+trap _exit EXIT
+
+usage() {
+  local command_name=$(basename ${0})
+  echo
+  echo "${command_name} usage: "
+  echo "  * ${command_name} /path/to/new.schema"
+  echo "      Add the given schema to the slapd backend"
+  echo "  * ${command_name} /path/to/new/schemadir"
+  echo "      Add *.schema under the given directory to the slapd 
+backend"
+  echo
+  echo "  Options:"
+  echo "    -d: The path to the ldap schema directory."
+  echo "        Defaults to '/etc/ldap/schema'"
+}
+
+check_schema_db() {
+  schema=$1
+  result=$(ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=schema,cn=config 
+-LLL '(&(objectclass=olcSchemaConfig)(cn=*'${schema}'))' cn 2> 
+/dev/null)
+  if [ -n "${result}" ] ; then
+    return 1
+  else
+    return 0
+  fi
+}
+
+add_schema() {
+  local origin_path=$1
+  local temp_ldif=$2
+  local dest_dir=$3
+  local schema=$(basename $origin_path .schema)
+
+  # make sure we don't duplicate schemas
+  echo -n "Adding schema for inclusion to slapd: ${schema}..."
+  if ! check_schema_db $schema ; then
+    echo "already there"
+    return 1
+  fi
+
+  local dest_path=${dest_dir}/${schema}.schema
+  cp $origin_path $dest_path
+
+  cat $temp_ldif > $tmpconf
+  echo "include $dest_path" >> $tmpconf
+
+  # parse the ldif file
+  out=$(slaptest -f $tmpconf -F $tmpdir 2>&1)
+  if [ $? != 0 ] ; then
+    echo "error while parsing schema"
+    echo $out
+    return 0
+  fi
+
+  # include schema
+  local schemaldif=${tmpdir}/cn\=config/cn\=schema/cn\={*}${schema}.ldif
+  # fix the dn and cn in the ldif entry
+  sed -i -e 's/^dn:.*$/dn: cn='${schema}',cn=schema,cn=config/; 
+s/^cn:.*$/cn: '${schema}'/;' $schemaldif
+  # delete the operational ldif metadata entries
+  sed -i -e '/^structuralObjectClass:.*$/d; /^entryUUID:.*$/d; 
+/^creatorsName:.*$/d; /^createTimestamp:.*$/d; /^entryCSN:.*$/d; 
+/^modifiersName:.*$/d; /^modifyTimestamp:.*$/d' $schemaldif
+
+  # add the schema to the database
+  out=$(ldapadd -Y EXTERNAL -H ldapi:/// -f $schemaldif 2>&1)
+  if [ $? != 0 ] ; then
+    echo "error while adding schema"
+    echo $out
+    return 0
+  fi
+
+  echo "ok"
+  return 1
+}
+
+LDAP_SCHEMA_DIR="/etc/ldap/schema"
+
+while getopts ":d:" optname ; do
+  case "${optname}" in
+    "d")
+      LDAP_SCHEMA_DIR=$OPTARG
+      ;;
+    "?")
+      echo "Unknown option ${OPTARG}"
+      usage
+      exit 1
+      ;;
+    ":")
+      echo "No value for ${OPTARG}"
+      usage
+      exit 1
+      ;;
+    *)
+      echo "Unknown error processing options"
+      exit 0
+      ;;
+  esac
+done
+
+# remove option switches already parsed
+shift `expr $OPTIND - 1`
+
+# we want one and only one argument
+# print our usage message if our given args don't work out
+if [ $# -ne 1 ] ; then
+  echo "Unexpected number of arguments."
+  usage
+  exit 0
+fi
+
+# let the user know they have to be root if they are not
+# u switch only gives the effective uid
+if [ `id -u` != 0 ] ; then
+  echo "$(basename ${0}) must be run as root!"
+  exit 1
+fi
+
+# make sure we have the tools we need
+CMDS="ldapsearch ldapadd slaptest"
+for cmd in $CMDS ; do
+  out=$(type $cmd 2>&1)
+  if [ $? -ne 0 ] ; then
+    echo "${cmd} not found."
+    exit 1
+  fi
+done
+
+SCHEMA_PATH=$1
+if [ ! -e $SCHEMA_PATH ] ; then
+  echo "No such file or directory: ${SCHEMA_PATH}"
+  exit 1
+fi
+
+if echo $SCHEMA_PATH | grep -q '.schema$' && [ -f $SCHEMA_PATH ] ; then
+  SCHEMA_LIST=$SCHEMA_PATH
+elif [ -d $SCHEMA_PATH ] ; then
+  SCHEMA_LIST=${SCHEMA_PATH}/*.schema
+else
+  echo "'${SCHEMA_PATH}' must be a directory or end with .schema."
+  exit 1
+fi
+
+if [ ! -d $LDAP_SCHEMA_DIR ] ; then
+  echo "Not a valid directory: ${LDAP_SCHEMA_DIR}"
+  exit 1
+fi
+
+# remove any trailing /
+LDAP_SCHEMA_DIR=$(echo $LDAP_SCHEMA_DIR | sed -e 's#/$##')
+
+# put old schemas in ldif file
+ORIG_SCHEMAS=$(ldapsearch -Y EXTERNAL -H ldapi:/// -b 
+cn=schema,cn=config -LLL '(objectclass=olcSchemaConfig)' cn 2> /dev/null 
+| sed -e '/^cn/!d; /cn: schema/d; s/^.*}//')
+ORIG_LIST=${tmpdir}/origlist.ldif
+for schema in $ORIG_SCHEMAS; do
+  echo "include ${LDAP_SCHEMA_DIR}/${schema}.schema" >> $ORIG_LIST
+done
+
+# add new schemas to ldif file
+for SCHEMA_ORIGIN in $SCHEMA_LIST ; do
+  add_schema $SCHEMA_ORIGIN $ORIG_LIST $LDAP_SCHEMA_DIR
+done
+
+exit 0
